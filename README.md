@@ -115,6 +115,4 @@ tests/              доменные и контрактные тесты кли
 - [Получение сообщений через HTTP API](https://green-api.com/telegram/docs/api/receiving/technology-http-api/)
 - [Статусы сообщений](https://green-api.com/telegram/docs/api/receiving/notifications-format/statuses/OutgoingMessageStatus/)
 
-Контракт проверен 26 сентября 2026 года. Реальная доставка требует действующего авторизованного инстанса. Проверки проекта с имитацией провайдера не подменяют проверку с вашим аккаунтом.
-
 Сведения об оригинальном фоне и шрифтах находятся в [списке сторонних материалов](docs/THIRD_PARTY_ASSETS.md).
