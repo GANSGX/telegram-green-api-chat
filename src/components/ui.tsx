@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
-import { Check, CheckCheck, CircleAlert, Clock3, Send, X } from 'lucide-react';
+import { Bookmark, Check, CheckCheck, CircleAlert, Clock3, X } from 'lucide-react';
 import clsx from 'clsx';
 import type { Message } from '../lib/types';
 
@@ -22,15 +22,27 @@ function initials(name: string) {
 export function Avatar({ name, small = false }: { name: string; small?: boolean }) {
   const hue = [...name].reduce((n, c) => n + c.charCodeAt(0), 0) % 5;
   return (
-    <span className={clsx('avatar', `avatar-${hue}`, small && 'avatar-small')} aria-hidden="true">
-      {initials(name)}
+    <span
+      className={clsx(
+        'avatar',
+        `avatar-${hue}`,
+        small && 'avatar-small',
+        name === 'Избранное' && 'avatar-saved',
+      )}
+      aria-hidden="true"
+    >
+      {name === 'Избранное' ? (
+        <Bookmark size={small ? 23 : 28} fill="currentColor" strokeWidth={1.5} />
+      ) : (
+        initials(name)
+      )}
     </span>
   );
 }
 export function TelegramMark({ large = false }: { large?: boolean }) {
   return (
     <span className={clsx('telegram-mark', large && 'large')}>
-      <Send size={large ? 31 : 23} strokeWidth={1.7} fill="currentColor" />
+      <img src="/telegram-logo.svg" alt="" width={large ? 120 : 42} height={large ? 120 : 42} />
     </span>
   );
 }

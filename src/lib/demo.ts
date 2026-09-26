@@ -54,7 +54,7 @@ export function createDemoHistory(): HistoryState {
       message('d9', 'demo-anna', 'Договорились, на связи!', 120),
       message('d10', 'demo-notes', 'Идеи начинаются с одного сообщения.', 240, true),
     ].sort((a, b) => a.timestamp - b.timestamp),
-    activeChatId: 'demo-maria',
+    activeChatId: null,
     drafts: {},
   };
 }

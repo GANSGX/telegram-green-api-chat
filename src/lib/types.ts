@@ -16,6 +16,22 @@ export interface Message {
   outgoing: boolean;
   status: MessageStatus;
   error?: string;
+  media?: MediaAttachment;
+}
+
+export interface MediaAttachment {
+  id: string;
+  kind: 'image' | 'video' | 'audio' | 'document';
+  fileName: string;
+  mimeType: string;
+  size?: number;
+  duration?: number;
+  url: string;
+  unavailable?: true;
+}
+
+export interface AttachmentOptions {
+  caption?: string;
 }
 
 export interface Session {
@@ -45,6 +61,7 @@ export type MessengerEvent =
       text: string;
       timestamp: number;
       outgoing: boolean;
+      media?: MediaAttachment;
     }
   | {
       kind: 'status';
@@ -70,3 +87,5 @@ export interface HistoryState {
 export const MAX_MESSAGE_LENGTH = 4096;
 export const MAX_HISTORY_MESSAGES = 2000;
 export const MAX_HISTORY_CHATS = 100;
+export const MAX_FILE_SIZE = 16 * 1024 * 1024;
+export const MAX_CAPTION_LENGTH = 1024;

@@ -69,6 +69,7 @@ export class GreenApi {
       httpMethod?: 'GET' | 'POST' | 'DELETE';
       receiptId?: number;
       receiveTimeout?: number;
+      form?: FormData;
     } = {},
   ): Promise<T> {
     const { apiUrl, idInstance, apiTokenInstance } = this.credentials;
@@ -76,8 +77,11 @@ export class GreenApi {
     const query =
       options.receiveTimeout === undefined ? '' : `?receiveTimeout=${options.receiveTimeout}`;
     const url = `${apiUrl}/waInstance${idInstance}/${method}/${encodeURIComponent(apiTokenInstance)}${suffix}${query}`;
-    const timeout =
-      options.receiveTimeout === undefined ? this.timeoutMs : (options.receiveTimeout + 5) * 1000;
+    const timeout = options.form
+      ? Math.max(this.timeoutMs, 60_000)
+      : options.receiveTimeout === undefined
+        ? this.timeoutMs
+        : (options.receiveTimeout + 5) * 1000;
     const controller = new AbortController();
     const abort = () => controller.abort();
     this.signal.addEventListener('abort', abort, { once: true });
@@ -86,12 +90,15 @@ export class GreenApi {
     timer.unref?.();
     try {
       const response = await this.fetcher(url, {
-        method: options.httpMethod ?? (options.body === undefined ? 'GET' : 'POST'),
+        method:
+          options.httpMethod ?? (options.body === undefined && !options.form ? 'GET' : 'POST'),
         headers:
-          options.body === undefined
+          options.body === undefined || options.form
             ? { Accept: 'application/json' }
             : { Accept: 'application/json', 'Content-Type': 'application/json' },
-        body: options.body === undefined ? undefined : JSON.stringify(options.body),
+        // Native FormData creates its own boundary. Never set multipart Content-Type manually.
+        body:
+          options.form ?? (options.body === undefined ? undefined : JSON.stringify(options.body)),
         signal: controller.signal,
         redirect: 'error',
         credentials: 'omit',

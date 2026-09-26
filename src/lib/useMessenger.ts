@@ -13,13 +13,16 @@ import {
 } from './domain';
 import { createDemoHistory, demoReply } from './demo';
 import { clearHistory, loadHistory, saveHistory } from './storage';
+import { attachmentValidationError, mediaKind } from './media';
 import {
   MAX_MESSAGE_LENGTH,
   type Chat,
+  type AttachmentOptions,
   type ConnectionState,
   type Credentials,
   type HistoryState,
   type Message,
+  type MediaAttachment,
   type MessengerMode,
   type Session,
 } from './types';
@@ -62,6 +65,7 @@ export function useMessenger() {
   const [isCreatingChat, setIsCreatingChat] = useState(false);
   const [isEnablingNotifications, setIsEnablingNotifications] = useState(false);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
   const [storageAvailable, setStorageAvailable] = useState(true);
   const historyRef = useRef(history);
   const modeRef = useRef(mode);
@@ -77,6 +81,9 @@ export function useMessenger() {
   const busyNotifications = useRef(false);
   const busyLogout = useRef(false);
   const sendInFlight = useRef(new Set<string>());
+  const uploadInFlight = useRef(new Set<string>());
+  const originalFiles = useRef(new Map<string, { file: File; options: AttachmentOptions }>());
+  const localMediaUrls = useRef(new Set<string>());
 
   const updateHistory = useCallback(
     (change: HistoryState | ((previous: HistoryState) => HistoryState)) => {
@@ -101,6 +108,11 @@ export function useMessenger() {
     demoTimers.current.forEach(clearTimeout);
     demoTimers.current.clear();
     sendInFlight.current.clear();
+    uploadInFlight.current.clear();
+    originalFiles.current.clear();
+    localMediaUrls.current.forEach((url) => URL.revokeObjectURL(url));
+    localMediaUrls.current.clear();
+    setIsUploading(false);
     ledger.current.clear();
     cursor.current = 0;
     busyResolve.current = false;
@@ -152,6 +164,22 @@ export function useMessenger() {
     if (mode !== 'live' || !session.instanceId) return;
     setStorageAvailable(saveHistory(session.instanceId, history));
   }, [mode, session.instanceId, history]);
+
+  useEffect(() => {
+    const visibleUrls = new Set(historyRef.current.messages.map((message) => message.media?.url));
+    for (const url of localMediaUrls.current) {
+      if (!visibleUrls.has(url)) {
+        URL.revokeObjectURL(url);
+        localMediaUrls.current.delete(url);
+      }
+    }
+    for (const clientId of originalFiles.current.keys()) {
+      const message = historyRef.current.messages.find((item) => item.clientId === clientId);
+      if (!message || message.status === 'delivered' || message.status === 'read') {
+        originalFiles.current.delete(clientId);
+      }
+    }
+  }, [history.messages]);
 
   useEffect(() => {
     if (mode !== 'live' || !session.authenticated) return;
@@ -412,6 +440,18 @@ export function useMessenger() {
     async (message: Message) => {
       const clientId = message.clientId!;
       if (sendInFlight.current.has(clientId)) return;
+      const original = message.media ? originalFiles.current.get(clientId) : undefined;
+      if (message.media && !original) {
+        const text = 'Исходный файл больше недоступен. Выберите его заново, чтобы отправить.';
+        setError(text);
+        updateHistory((previous) => ({
+          ...previous,
+          messages: previous.messages.map((item) =>
+            item.clientId === clientId ? { ...item, status: 'failed', error: text } : item,
+          ),
+        }));
+        return;
+      }
       sendInFlight.current.add(clientId);
       const epoch = generation.current;
       if (modeRef.current === 'demo') {
@@ -421,11 +461,23 @@ export function useMessenger() {
         return;
       }
       const pending = controller();
+      if (original) {
+        uploadInFlight.current.add(clientId);
+        setIsUploading(true);
+      }
       try {
-        const response = await api.send(message.chatId, message.text, clientId, pending.signal);
+        const response: { idMessage: string; media?: MediaAttachment } = original
+          ? await api.sendMedia(
+              message.chatId,
+              original.file,
+              clientId,
+              original.options,
+              pending.signal,
+            )
+          : await api.send(message.chatId, message.text, clientId, pending.signal);
         if (epoch !== generation.current) return;
         updateHistory((previous) => {
-          const confirmed = confirmMessage(previous, clientId, response.idMessage);
+          const confirmed = confirmMessage(previous, clientId, response.idMessage, response.media);
           const earlierStatus = ledger.current.get(messageKey(message.chatId, response.idMessage));
           return earlierStatus && earlierStatus.status !== 'sending'
             ? applyEvent(
@@ -462,9 +514,63 @@ export function useMessenger() {
       } finally {
         controllers.current.delete(pending);
         sendInFlight.current.delete(clientId);
+        if (epoch === generation.current) {
+          uploadInFlight.current.delete(clientId);
+          setIsUploading(uploadInFlight.current.size > 0);
+        }
       }
     },
     [controller, scheduleDemo, updateHistory],
+  );
+
+  const sendAttachment = useCallback(
+    async (file: File, options: AttachmentOptions = {}): Promise<void> => {
+      const chatId = historyRef.current.activeChatId;
+      if (!chatId || modeRef.current === 'login' || busyLogout.current) return;
+      const validationError = attachmentValidationError(file, options);
+      if (validationError) {
+        setError(validationError);
+        return;
+      }
+      const id = crypto.randomUUID();
+      let url: string;
+      try {
+        url = URL.createObjectURL(file);
+      } catch {
+        setError('Не удалось открыть файл. Выберите его ещё раз.');
+        return;
+      }
+      localMediaUrls.current.add(url);
+      originalFiles.current.set(id, { file, options: { ...options } });
+      const message: Message = {
+        id,
+        clientId: id,
+        chatId,
+        text: options.caption ?? '',
+        timestamp: Date.now(),
+        outgoing: true,
+        status: 'sending',
+        media: {
+          id,
+          kind: mediaKind(file.type),
+          fileName: file.name || 'Файл',
+          mimeType: file.type || 'application/octet-stream',
+          size: file.size,
+          url,
+        },
+      };
+      setError(null);
+      updateHistory((previous) => ({
+        ...previous,
+        messages: upsertMessage(previous.messages, message),
+        drafts:
+          options.caption !== undefined && previous.drafts[chatId] === options.caption
+            ? { ...previous.drafts, [chatId]: '' }
+            : previous.drafts,
+      }));
+      await dispatchMessage(message);
+    },
+    [dispatchMessage, updateHistory],
   );
 
   const sendMessage = useCallback(
@@ -509,6 +615,18 @@ export function useMessenger() {
         busyLogout.current
       )
         return;
+      const original = message.media ? originalFiles.current.get(message.clientId) : undefined;
+      if (message.media && !original) {
+        const text = 'Исходный файл больше недоступен. Выберите его заново, чтобы отправить.';
+        setError(text);
+        updateHistory((previous) => ({
+          ...previous,
+          messages: previous.messages.map((item) =>
+            item === message ? { ...item, error: text } : item,
+          ),
+        }));
+        return;
+      }
       const next: Message = {
         ...message,
         id: crypto.randomUUID(),
@@ -516,6 +634,10 @@ export function useMessenger() {
         status: 'sending',
         error: undefined,
       };
+      if (original) {
+        originalFiles.current.set(next.clientId!, original);
+        originalFiles.current.delete(message.clientId);
+      }
       updateHistory((previous) => ({
         ...previous,
         messages: previous.messages.map((item) => (item === message ? next : item)),
@@ -573,6 +695,7 @@ export function useMessenger() {
     isCreatingChat,
     isEnablingNotifications,
     isLoggingOut,
+    isUploading,
     storageAvailable,
     drafts: history.drafts,
     draft: history.activeChatId ? (history.drafts[history.activeChatId] ?? '') : '',
@@ -582,6 +705,7 @@ export function useMessenger() {
     selectChat,
     createChat,
     sendMessage,
+    sendAttachment,
     retryMessage,
     enableNotifications,
     setDraft,

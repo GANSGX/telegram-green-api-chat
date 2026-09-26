@@ -1,7 +1,8 @@
-import { LogOut, MessageCircle, Plus, Search, Settings2, ShieldCheck, X } from 'lucide-react';
+import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
+import { LogOut, Menu, MessageCircle, Pencil, Plus, Search, Settings2, X } from 'lucide-react';
 import clsx from 'clsx';
 import type { Messenger } from '../lib/useMessenger';
-import { Avatar, TelegramMark, time } from './ui';
+import { Avatar, MessageStatus, time } from './ui';
 
 interface SidebarProps {
   messenger: Messenger;
@@ -23,29 +24,48 @@ export function Sidebar({
   const filteredChats = messenger.chats.filter((chat) =>
     `${chat.name} ${chat.recipient || ''} ${chat.id}`.toLowerCase().includes(query.toLowerCase()),
   );
+
+  function openNewChat() {
+    messenger.clearError();
+    onNewChat();
+  }
+
   return (
     <aside className="sidebar" aria-label="Список чатов">
       <header className="sidebar-header">
-        <div className="brand">
-          <TelegramMark />
-          <span>Telegram</span>
-        </div>
-        <button
-          className="icon-button"
-          onClick={() => onSettings()}
-          aria-label="Настройки подключения"
-        >
-          <Settings2 size={21} />
-        </button>
-      </header>
-      <div className="sidebar-tools">
+        <DropdownMenu.Root>
+          <DropdownMenu.Trigger asChild>
+            <button className="icon-button sidebar-menu-trigger" aria-label="Главное меню">
+              <Menu size={24} />
+            </button>
+          </DropdownMenu.Trigger>
+          <DropdownMenu.Portal>
+            <DropdownMenu.Content className="sidebar-menu-content" sideOffset={8} align="start">
+              <DropdownMenu.Item className="sidebar-menu-item" onSelect={openNewChat}>
+                <Plus size={21} /> Новый чат
+              </DropdownMenu.Item>
+              <DropdownMenu.Item className="sidebar-menu-item" onSelect={onSettings}>
+                <Settings2 size={21} /> Подключение
+              </DropdownMenu.Item>
+              <DropdownMenu.Separator className="sidebar-menu-separator" />
+              <DropdownMenu.Item
+                className="sidebar-menu-item"
+                disabled={messenger.isLoggingOut}
+                onSelect={() => void messenger.logout()}
+              >
+                <LogOut size={21} />
+                {messenger.mode === 'demo' ? 'Выйти из демоверсии' : 'Выйти'}
+              </DropdownMenu.Item>
+            </DropdownMenu.Content>
+          </DropdownMenu.Portal>
+        </DropdownMenu.Root>
         <div className="search-field">
-          <Search size={19} />
+          <Search size={22} />
           <input
             aria-label="Поиск чатов"
             placeholder="Поиск"
             value={query}
-            onChange={(e) => onQueryChange(e.target.value)}
+            onChange={(event) => onQueryChange(event.target.value)}
           />
           {query && (
             <button
@@ -53,27 +73,21 @@ export function Sidebar({
               aria-label="Очистить поиск"
               onClick={() => onQueryChange('')}
             >
-              <X size={16} />
+              <X size={18} />
             </button>
           )}
+          <button
+            className="search-profile"
+            aria-label="Настройки подключения"
+            onClick={onSettings}
+          >
+            Я
+          </button>
         </div>
-        <button
-          className="new-chat-button"
-          onClick={() => {
-            messenger.clearError();
-            onNewChat();
-          }}
-        >
-          <Plus size={18} /> Новый чат
-        </button>
-      </div>
-      <div className="chats-heading">
-        <span>Все сообщения</span>
-        <span>{messenger.chats.length}</span>
-      </div>
+      </header>
       <nav className="chat-list" aria-label="Диалоги">
         {filteredChats.map((chat) => {
-          const last = messenger.messages.filter((m) => m.chatId === chat.id).at(-1);
+          const last = messenger.messages.filter((message) => message.chatId === chat.id).at(-1);
           return (
             <button
               key={chat.id}
@@ -88,7 +102,12 @@ export function Sidebar({
               <span className="chat-item-body">
                 <span className="chat-item-top">
                   <strong>{chat.name}</strong>
-                  {last && <time>{time(last.timestamp)}</time>}
+                  {last && (
+                    <span className="chat-item-meta">
+                      {last.outgoing && <MessageStatus status={last.status} />}
+                      <time>{time(last.timestamp)}</time>
+                    </span>
+                  )}
                 </span>
                 <span className="chat-item-bottom">
                   <span className="chat-preview">
@@ -99,7 +118,12 @@ export function Sidebar({
                     ) : last ? (
                       <>
                         {last.outgoing && <span>Вы · </span>}
-                        {last.text}
+                        {last.text ||
+                          (last.media?.kind === 'image'
+                            ? 'Фото'
+                            : last.media?.kind === 'video'
+                              ? 'Видео'
+                              : last.media?.fileName || 'Файл')}
                       </>
                     ) : (
                       'Начните разговор'
@@ -123,27 +147,12 @@ export function Sidebar({
           </div>
         )}
       </nav>
-      <footer className="sidebar-footer">
-        <span className="account-icon">
-          <ShieldCheck size={20} />
-        </span>
-        <div>
-          <strong>{messenger.mode === 'demo' ? 'Демонстрация' : 'GREEN-API подключён'}</strong>
-          <span>
-            {messenger.mode === 'demo'
-              ? 'Без реальной отправки'
-              : `Инстанс ${messenger.session?.instanceId || ''}`}
-          </span>
-        </div>
-        <button
-          className="icon-button"
-          disabled={messenger.isLoggingOut}
-          onClick={() => void messenger.logout()}
-          aria-label={messenger.mode === 'demo' ? 'Выйти из демоверсии' : 'Отключиться'}
-        >
-          <LogOut size={19} />
-        </button>
-      </footer>
+      {messenger.mode === 'demo' && (
+        <span className="sidebar-demo-label">Демо · без реальной отправки</span>
+      )}
+      <button className="sidebar-compose" aria-label="Новый чат" onClick={openNewChat}>
+        <Pencil size={25} />
+      </button>
     </aside>
   );
 }

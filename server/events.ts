@@ -1,3 +1,5 @@
+import { type IncomingMedia, type Media, type MediaKind } from './media.js';
+
 export type ChatEvent =
   | {
       kind: 'message';
@@ -8,6 +10,7 @@ export type ChatEvent =
       timestamp: number;
       outgoing: boolean;
       clientId?: string;
+      media?: Media;
     }
   | { kind: 'status'; id: string; chatId: string; status: 'sent' | 'delivered' | 'read' | 'failed' }
   | { kind: 'connection'; state: 'connected' | 'reconnecting' | 'unauthorized'; message?: string };
@@ -20,8 +23,12 @@ const record = (value: unknown): RecordValue | undefined =>
 const string = (value: unknown): string | undefined =>
   typeof value === 'string' ? value : undefined;
 
-/** Convert only the text/chat events supported by this app. Unknown notifications are still acknowledged. */
-export function normalizeNotification(body: unknown, instanceId: string): ChatEvent | null {
+/** Provider URLs stay inside the session registry. They must never be copied into public events. */
+export function normalizeNotification(
+  body: unknown,
+  instanceId: string,
+  registerMedia?: (input: IncomingMedia, chatId: string, messageId: string) => Media,
+): ChatEvent | null {
   const webhook = record(body);
   if (!webhook) return null;
   const instance = record(webhook.instanceData);
@@ -58,12 +65,34 @@ export function normalizeNotification(body: unknown, instanceId: string): ChatEv
     !Number.isFinite(webhook.timestamp)
   )
     return null;
-  const text =
+  let text =
     data.typeMessage === 'textMessage'
       ? string(record(data.textMessageData)?.textMessage)
       : data.typeMessage === 'extendedTextMessage'
         ? string(record(data.extendedTextMessageData)?.text)
         : undefined;
+  let media: Media | undefined;
+  const mediaKinds: Record<string, MediaKind> = {
+    imageMessage: 'image',
+    videoMessage: 'video',
+    audioMessage: 'audio',
+    documentMessage: 'document',
+  };
+  const kind = mediaKinds[String(data.typeMessage)];
+  const file = record(data.fileMessageData);
+  if (kind && file && registerMedia) {
+    text = string(file.caption) ?? '';
+    media = registerMedia(
+      {
+        kind,
+        fileName: string(file.fileName)?.slice(0, 512) ?? 'attachment.bin',
+        mimeType: string(file.mimeType)?.slice(0, 128) ?? 'application/octet-stream',
+        downloadUrl: string(file.downloadUrl) ?? '',
+      },
+      chatId,
+      id,
+    );
+  }
   if (text === undefined || text.length > 65_536) return null;
   const senderName =
     string(sender?.chatName) ||
@@ -78,6 +107,7 @@ export function normalizeNotification(body: unknown, instanceId: string): ChatEv
     text,
     timestamp: webhook.timestamp * 1000,
     outgoing,
+    ...(media ? { media } : {}),
   };
 }
 

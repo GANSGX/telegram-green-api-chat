@@ -10,8 +10,15 @@ import {
   upsertMessage,
   type StatusLedger,
 } from '../src/lib/domain';
-import { parseHistory } from '../src/lib/storage';
-import type { HistoryState, Message, MessengerEvent } from '../src/lib/types';
+import { parseHistory, saveHistory } from '../src/lib/storage';
+import { attachmentValidationError, mediaKind, persistentMedia } from '../src/lib/media';
+import {
+  MAX_FILE_SIZE,
+  type HistoryState,
+  type MediaAttachment,
+  type Message,
+  type MessengerEvent,
+} from '../src/lib/types';
 
 const outgoing = (overrides: Partial<Message> = {}): Message => ({
   id: 'local-1',
@@ -268,4 +275,170 @@ describe('browser to server API contract', () => {
     expect(failure).toBeInstanceOf(ApiError);
     expect(failure).toMatchObject({ cursor: 555, code: 'EVENTS_EXPIRED', status: 409 });
   });
+});
+
+describe('media messages and privacy', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  const media: MediaAttachment = {
+    id: 'opaque-media-1',
+    kind: 'audio',
+    fileName: 'sample.webm',
+    mimeType: 'audio/webm',
+    size: 24,
+    duration: 1.5,
+    url: '/api/media/opaque-media-1',
+  };
+
+  it('sends real MIME bytes with a browser-generated multipart boundary', async () => {
+    const file = new File(['audio bytes'], 'sample.webm', { type: 'audio/webm' });
+    const fetcher = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(JSON.stringify({ idMessage: 'provider-1', media }), { status: 200 }),
+      );
+    vi.stubGlobal('fetch', fetcher);
+    await api.sendMedia('42', file, 'client-media-1', { caption: '' });
+    const [path, options] = fetcher.mock.calls[0] as [string, RequestInit];
+    expect(path).toBe('/api/messages/media');
+    expect(options.method).toBe('POST');
+    expect(options.credentials).toBe('same-origin');
+    expect(options.headers).not.toHaveProperty('Content-Type');
+    const body = options.body as FormData;
+    expect(body.get('file')).toMatchObject({ name: 'sample.webm', type: 'audio/webm' });
+    expect(body.get('clientId')).toBe('client-media-1');
+    expect(body.get('kind')).toBe('file');
+    expect(body.has('duration')).toBe(false);
+    expect(body.get('caption')).toBe('');
+  });
+
+  it('does not consider ambiguous upload/send loss safe to retry', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Network error')));
+    await expect(
+      api.sendMedia('42', new File(['file'], 'note.txt'), 'client-media-1'),
+    ).rejects.toMatchObject({ ambiguous: true });
+  });
+
+  it('deduplicates media-only outgoing echoes before their response', () => {
+    const optimistic = outgoing({ text: '', media: { ...media, url: 'blob:local-preview' } });
+    const echo = incoming({
+      id: 'server-1',
+      clientId: 'client-1',
+      outgoing: true,
+      text: '',
+      media,
+    });
+    const echoed = applyEvent({ ...initial(), messages: [optimistic] }, echo);
+    const confirmed = confirmMessage(echoed, 'client-1', 'server-1', media);
+    expect(confirmed.messages).toHaveLength(1);
+    expect(confirmed.messages[0]).toMatchObject({
+      id: 'server-1',
+      text: '',
+      media,
+      status: 'sent',
+    });
+  });
+
+  it('retains attachments when a later text-only echo omits media metadata', () => {
+    const withMedia = outgoing({ id: 'server-1', media, status: 'read' });
+    const result = applyEvent(
+      { ...initial(), messages: [withMedia] },
+      incoming({ id: 'server-1', text: 'Привет', outgoing: true }),
+    );
+    expect(result.messages[0].media).toEqual(media);
+    expect(result.messages[0].status).toBe('read');
+  });
+
+  it('preserves incoming media without a caption and unread deduplication', () => {
+    const state = { ...initial(), activeChatId: null };
+    const event = incoming({ text: '', media });
+    const result = applyEvent(applyEvent(state, event), event);
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0].media).toEqual(media);
+    expect(result.messages[0].text).toBe('');
+    expect(result.chats[0].unread).toBe(1);
+  });
+
+  it.each([
+    'blob:https://localhost/private-object',
+    'data:audio/webm;base64,secret',
+    'https://provider.example/token/file',
+    '/api/media/opaque?token=secret',
+    '/api/media/../session',
+    '//provider.example/secret',
+  ])('never persists an unapproved URL %s', (url) => {
+    const stored = persistentMedia({ ...media, url });
+    expect(stored).toMatchObject({ ...media, url: '' });
+    expect(JSON.stringify(stored)).not.toContain(url);
+  });
+
+  it('serializes only supported media metadata and restores an expired local preview', () => {
+    const setItem = vi.fn();
+    vi.stubGlobal('sessionStorage', { setItem });
+    const original = {
+      ...media,
+      url: 'blob:local-preview',
+      file: new File(['secret'], 'sample.webm'),
+      providerUrl: 'https://provider/secret-token',
+    };
+    expect(
+      saveHistory('instance-1', {
+        ...initial(),
+        messages: [outgoing({ text: '', media: original })],
+      }),
+    ).toBe(true);
+    const serialized = setItem.mock.calls[0][1] as string;
+    expect(serialized).not.toContain('blob:');
+    expect(serialized).not.toContain('secret');
+    const restored = parseHistory(serialized);
+    expect(restored.messages[0]).toMatchObject({
+      text: '',
+      status: 'unknown',
+      media: { ...media, url: '' },
+    });
+  });
+
+  it('keeps approved BFF URLs and unavailable markers in restored media', () => {
+    const restored = parseHistory(
+      JSON.stringify({
+        ...initial(),
+        messages: [outgoing({ status: 'sent', media: { ...media, unavailable: true } })],
+      }),
+    );
+    expect(restored.messages[0].media).toEqual({ ...media, unavailable: true });
+  });
+
+  it('rejects empty, oversized or long-caption uploads before network I/O', () => {
+    expect(attachmentValidationError({ size: 0 }, {})).toContain('пустой');
+    expect(attachmentValidationError({ size: MAX_FILE_SIZE + 1 }, {})).toContain('16 МБ');
+    expect(attachmentValidationError({ size: MAX_FILE_SIZE }, {})).toBeNull();
+    expect(attachmentValidationError({ size: 10 }, { caption: 'a'.repeat(1025) })).toContain(
+      '1024',
+    );
+  });
+
+  it('uses the actual file MIME for preview types', () => {
+    expect(mediaKind('image/png')).toBe('image');
+    expect(mediaKind('video/webm')).toBe('video');
+    expect(mediaKind('audio/webm')).toBe('audio');
+    expect(mediaKind('application/pdf')).toBe('document');
+  });
+
+  it.each([
+    'image/svg+xml',
+    'image/svg',
+    'text/html',
+    'application/xhtml+xml',
+    'image/unknown',
+    '',
+  ])('treats active or unknown MIME %s as a download-only document', (mimeType) => {
+    expect(mediaKind(mimeType)).toBe('document');
+  });
+
+  it.each(['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/avif'])(
+    'allows a raster preview for %s',
+    (mimeType) => {
+      expect(mediaKind(mimeType)).toBe('image');
+    },
+  );
 });

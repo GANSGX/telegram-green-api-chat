@@ -3,6 +3,7 @@ import {
   type Chat,
   type HistoryState,
   type Message,
+  type MediaAttachment,
   type MessageStatus,
   type MessengerEvent,
 } from './types';
@@ -48,6 +49,7 @@ export function upsertMessage(messages: Message[], incoming: Message): Message[]
     ...current,
     ...incoming,
     clientId: incoming.clientId ?? current.clientId,
+    media: incoming.media ?? current.media,
     status,
   };
   if (status !== 'failed' && status !== 'unknown') delete merged.error;
@@ -104,6 +106,7 @@ export function applyEvent(
     text: event.text,
     timestamp: event.timestamp,
     outgoing: event.outgoing,
+    media: event.media,
     status: pendingStatus?.status ?? (event.outgoing ? 'sent' : 'delivered'),
     error: pendingStatus?.status === 'failed' ? pendingStatus.description : undefined,
   };
@@ -124,6 +127,7 @@ export function confirmMessage(
   state: HistoryState,
   clientId: string,
   serverId: string,
+  media?: MediaAttachment,
 ): HistoryState {
   const optimistic = state.messages.find((message) => message.clientId === clientId);
   if (!optimistic) return state;
@@ -140,6 +144,7 @@ export function confirmMessage(
     ...echo,
     id: serverId,
     clientId,
+    media: media ?? echo?.media ?? optimistic.media,
     status,
     error: undefined,
   };

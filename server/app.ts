@@ -1,8 +1,17 @@
 import express, { type ErrorRequestHandler, type Request, type Response } from 'express';
 import { createHash, randomBytes } from 'node:crypto';
 import { z } from 'zod';
+import multer from 'multer';
 import { ApiError, GreenApi, type Fetch } from './green-api.js';
 import { eventKey, normalizeNotification, type ChatEvent } from './events.js';
+import {
+  downloadMedia,
+  inspectUpload,
+  MAX_MEDIA_BYTES,
+  MediaRegistry,
+  uploadedName,
+  type Media,
+} from './media.js';
 
 const COOKIE = 'telegram_chat_session';
 const credentialSchema = z
@@ -36,6 +45,20 @@ const messageSchema = z
       .regex(/^[A-Za-z0-9_-]+$/),
   })
   .strict();
+const mediaSchema = z
+  .object({
+    chatId: messageSchema.shape.chatId,
+    clientId: messageSchema.shape.clientId,
+    caption: z.string().max(1024, 'Подпись не должна превышать 1024 символа.').default(''),
+    kind: z.literal('file').default('file'),
+    duration: z
+      .string()
+      .regex(/^\d+(\.\d+)?$/)
+      .transform(Number)
+      .refine((value) => value > 0 && value <= 600, 'Запись не должна превышать 10 минут.')
+      .optional(),
+  })
+  .strict();
 type Settings = {
   typeInstance?: string;
   webhookUrl?: string;
@@ -53,7 +76,7 @@ type SendEntry = {
   chatId: string;
   idMessage?: string;
   status: 'pending' | 'complete' | 'uncertain' | 'rejected';
-  promise: Promise<{ idMessage: string }>;
+  promise: Promise<{ idMessage: string; media?: Media }>;
   createdAt: number;
 };
 type Session = {
@@ -73,6 +96,7 @@ type Session = {
   connectionKey: string;
   listeners: Set<() => void>;
   sends: Map<string, SendEntry>;
+  media: MediaRegistry;
   notificationsChange?: Promise<void>;
 };
 
@@ -90,7 +114,7 @@ export interface ServerOptions {
   retryBaseMs?: number;
 }
 
-function parse<T>(schema: z.ZodType<T>, body: unknown): T {
+function parse<T>(schema: z.ZodType<T, z.ZodTypeDef, unknown>, body: unknown): T {
   const result = schema.safeParse(body);
   if (!result.success)
     throw new ApiError(
@@ -216,6 +240,55 @@ export function createApp(options: ServerOptions = {}) {
   // Reservation is acquired before upstream validation so concurrent logins cannot create two consumers.
   const instances = new Map<string, string>();
   const loginAttempts = new Map<string, { count: number; until: number }>();
+  let activeUploads = 0;
+  let activeDownloads = 0;
+  const downloadWaiters: (() => void)[] = [];
+  async function acquireDownload(signal: AbortSignal): Promise<() => void> {
+    if (signal.aborted) throw new ApiError(410, 'MEDIA_UNAVAILABLE', 'Загрузка вложения прервана.');
+    if (downloadWaiters.length >= 64)
+      throw new ApiError(429, 'DOWNLOADS_BUSY', 'Загрузка вложений занята. Попробуйте позже.');
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timer);
+        signal.removeEventListener('abort', cancel);
+      };
+      const cancel = () => {
+        cleanup();
+        const index = downloadWaiters.indexOf(grant);
+        if (index >= 0) downloadWaiters.splice(index, 1);
+        reject(
+          new ApiError(410, 'MEDIA_UNAVAILABLE', 'Загрузка вложения прервана. Попробуйте позже.'),
+        );
+      };
+      const grant = () => {
+        cleanup();
+        activeDownloads++;
+        let released = false;
+        resolve(() => {
+          if (released) return;
+          released = true;
+          activeDownloads--;
+          downloadWaiters.shift()?.();
+        });
+      };
+      const timer = setTimeout(cancel, 60_000);
+      timer.unref?.();
+      signal.addEventListener('abort', cancel, { once: true });
+      if (activeDownloads < 4) grant();
+      else downloadWaiters.push(grant);
+    });
+  }
+  const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: {
+      fileSize: MAX_MEDIA_BYTES,
+      files: 1,
+      fields: 5,
+      fieldSize: 8192,
+      fieldNameSize: 64,
+      parts: 6,
+    },
+  }).single('file');
 
   function publish(session: Session, event: ChatEvent) {
     if (session.abort.signal.aborted) return;
@@ -243,6 +316,7 @@ export function createApp(options: ServerOptions = {}) {
     session.events.length = 0;
     session.seen.clear();
     session.sends.clear();
+    session.media.clear();
   }
 
   function findSession(request: Request): Session | undefined {
@@ -342,7 +416,11 @@ export function createApp(options: ServerOptions = {}) {
               'GREEN-API вернул некорректное уведомление.',
             );
           }
-          const event = normalizeNotification(notification.body, session.instanceId);
+          const event = normalizeNotification(
+            notification.body,
+            session.instanceId,
+            (input, chatId, id) => session.media.register(input, chatId, id),
+          );
           if (event?.kind === 'message' && event.outgoing) {
             // An API webhook may beat the send HTTP response. Wait for matching in-flight requests,
             // then correlate using the provider id, never by text alone (identical messages are valid).
@@ -350,12 +428,18 @@ export function createApp(options: ServerOptions = {}) {
               .update(`${event.chatId}\0${event.text}`)
               .digest('hex');
             const matching = [...session.sends.values()].filter(
-              (entry) => entry.status === 'pending' && entry.hash === hash,
+              (entry) =>
+                entry.status === 'pending' &&
+                (event.media ? entry.chatId === event.chatId : entry.hash === hash),
             );
             if (matching.length) await Promise.allSettled(matching.map((entry) => entry.promise));
             for (const [clientId, entry] of session.sends) {
               if (entry.idMessage === event.id && entry.chatId === event.chatId) {
                 event.clientId = clientId;
+                if (event.media) {
+                  const sent = await entry.promise.catch(() => undefined);
+                  if (sent?.media) event.media = sent.media;
+                }
                 break;
               }
             }
@@ -414,7 +498,15 @@ export function createApp(options: ServerOptions = {}) {
     const site = request.get('sec-fetch-site');
     if ((origin && !origins.has(origin)) || site === 'cross-site')
       return next(new ApiError(403, 'ORIGIN_REJECTED', 'Запрос с другого сайта отклонён.'));
-    if (['POST', 'PUT', 'PATCH'].includes(request.method) && !request.is('application/json'))
+    const isMediaUpload =
+      request.method === 'POST' &&
+      request.path === '/messages/media' &&
+      request.is('multipart/form-data');
+    if (
+      ['POST', 'PUT', 'PATCH'].includes(request.method) &&
+      !request.is('application/json') &&
+      !isMediaUpload
+    )
       return next(new ApiError(415, 'JSON_REQUIRED', 'Ожидается запрос в формате JSON.'));
     next();
   });
@@ -473,6 +565,7 @@ export function createApp(options: ServerOptions = {}) {
       connectionKey: '',
       listeners: new Set(),
       sends: new Map(),
+      media: new MediaRegistry(credentials.apiUrl, credentials.idInstance),
     };
     const abandonLogin = () => {
       if (response.writableFinished) return;
@@ -684,6 +777,201 @@ export function createApp(options: ServerOptions = {}) {
     response.json(await entry.promise);
   });
 
+  app.post('/api/messages/media', async (request, response) => {
+    // Authentication and origin checks precede parsing or allocating an upload buffer.
+    const session = requireSession(request);
+    ensureAuthorized(session);
+    if (!request.is('multipart/form-data'))
+      throw new ApiError(
+        415,
+        'MULTIPART_REQUIRED',
+        'Ожидается файл в формате multipart/form-data.',
+      );
+    if (activeUploads >= 4)
+      throw new ApiError(
+        429,
+        'UPLOADS_BUSY',
+        'Одновременно можно загружать не более четырёх файлов.',
+      );
+    if (Number(request.get('content-length')) > MAX_MEDIA_BYTES + 32_768)
+      throw new ApiError(413, 'MEDIA_TOO_LARGE', 'Файл не должен превышать 16 МиБ.');
+    activeUploads++;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const interrupted = () =>
+          reject(new ApiError(400, 'UPLOAD_INTERRUPTED', 'Загрузка файла прервана.'));
+        request.once('aborted', interrupted);
+        upload(request, response, (error) => {
+          request.off('aborted', interrupted);
+          if (error) reject(error);
+          else resolve();
+        });
+      });
+      if (session.abort.signal.aborted)
+        throw new ApiError(401, 'AUTH_REQUIRED', 'Сессия завершилась. Подключите GREEN-API снова.');
+      const payload = parse(mediaSchema, request.body);
+      const file = request.file;
+      if (!file || !file.size) throw new ApiError(400, 'FILE_REQUIRED', 'Выберите непустой файл.');
+      const fileName = uploadedName(file.originalname);
+      const inspected = inspectUpload(file.buffer, file.mimetype);
+      const kind = inspected.kind;
+      const hash = createHash('sha256')
+        .update(
+          JSON.stringify([
+            'media',
+            payload.chatId,
+            payload.caption,
+            kind,
+            fileName,
+            inspected.mimeType,
+            file.size,
+            payload.duration ?? null,
+            createHash('sha256').update(file.buffer).digest('hex'),
+          ]),
+        )
+        .digest('hex');
+      let entry = session.sends.get(payload.clientId);
+      if (entry && entry.hash !== hash)
+        throw new ApiError(
+          409,
+          'IDEMPOTENCY_CONFLICT',
+          'Этот идентификатор отправки уже использован для другого сообщения.',
+        );
+      if (!entry || entry.status === 'rejected') {
+        if (!entry && session.sends.size >= 2000)
+          throw new ApiError(
+            429,
+            'SEND_LIMIT_REACHED',
+            'Достигнут лимит сообщений сессии. Переподключитесь после завершения отправок.',
+          );
+        const next: SendEntry = {
+          hash,
+          chatId: payload.chatId,
+          status: 'pending',
+          createdAt: Date.now(),
+          promise: Promise.resolve({ idMessage: '' }),
+        };
+        session.sends.set(payload.clientId, next);
+        next.promise = (async () => {
+          try {
+            const form = new FormData();
+            form.append('chatId', payload.chatId);
+            form.append('fileName', fileName);
+            if (payload.caption) form.append('caption', payload.caption);
+            // Preserve browser codec/container. Changing a file extension does not transcode audio.
+            form.append(
+              'file',
+              new Blob([new Uint8Array(file.buffer)], { type: inspected.mimeType }),
+              fileName,
+            );
+            const result = await session.api.call<{ idMessage?: string; urlFile?: string }>(
+              'sendFileByUpload',
+              { form },
+            );
+            if (!result || typeof result.idMessage !== 'string' || !result.idMessage)
+              throw new ApiError(
+                502,
+                'INVALID_PROVIDER_RESPONSE',
+                'GREEN-API не подтвердил отправку файла.',
+              );
+            next.status = 'complete';
+            next.idMessage = result.idMessage;
+            const media = session.media.register(
+              {
+                kind,
+                fileName,
+                mimeType: inspected.mimeType,
+                downloadUrl: typeof result.urlFile === 'string' ? result.urlFile : '',
+              },
+              payload.chatId,
+              result.idMessage,
+              { size: file.size, ...(payload.duration ? { duration: payload.duration } : {}) },
+              true,
+            );
+            return { idMessage: result.idMessage, media };
+          } catch (error) {
+            if (!(error instanceof ApiError) || error.status >= 500) {
+              next.status = 'uncertain';
+              const uncertain = new ApiError(
+                502,
+                'SEND_UNCERTAIN',
+                'Подтверждение отправки файла не получено. Файл мог уйти. Проверьте чат в Telegram перед повторной отправкой.',
+              );
+              Object.assign(uncertain, { ambiguous: true, retryable: false });
+              throw uncertain;
+            }
+            next.status = 'rejected';
+            Object.assign(error, { ambiguous: false, retryable: true });
+            throw error;
+          }
+        })();
+        entry = next;
+      }
+      const result = await entry.promise;
+      if (!response.destroyed) response.json(result);
+    } finally {
+      // Retain only response metadata/idempotency state. Uploaded buffers are never cached or persisted.
+      request.file = undefined;
+      activeUploads--;
+    }
+  });
+
+  app.get('/api/media/:id', async (request, response) => {
+    const session = requireSession(request);
+    if (!/^[A-Za-z0-9_-]{32}$/.test(String(request.params.id)))
+      throw new ApiError(404, 'MEDIA_NOT_FOUND', 'Вложение не найдено.');
+    const record = session.media.get(String(request.params.id));
+    const abort = new AbortController();
+    const stop = () => abort.abort();
+    session.abort.signal.addEventListener('abort', stop, { once: true });
+    response.once('close', stop);
+    let release: (() => void) | undefined;
+    try {
+      // Browser media elements may fan out together. Queue them instead of permanently breaking the fifth image.
+      release = await acquireDownload(abort.signal);
+      const bytes = await downloadMedia(record.source!, fetcher, abort.signal);
+      if (response.destroyed) return;
+      const { mimeType, kind } = inspectUpload(bytes, record.media.mimeType);
+      response.set({
+        'Content-Type': mimeType,
+        'Content-Disposition': `${kind === 'document' ? 'attachment' : 'inline'}; filename="attachment"; filename*=UTF-8''${encodeURIComponent(record.media.fileName).replace(/['()*]/g, (c) => `%${c.charCodeAt(0).toString(16)}`)}`,
+        'Cross-Origin-Resource-Policy': 'same-origin',
+        'Content-Security-Policy': "default-src 'none'; sandbox",
+        'Accept-Ranges': 'bytes',
+      });
+      const range = request.get('range');
+      if (range) {
+        const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+        const start = match?.[1]
+          ? Number(match[1])
+          : Math.max(0, bytes.length - Number(match?.[2]));
+        const end =
+          match?.[1] && match?.[2]
+            ? Math.min(Number(match[2]), bytes.length - 1)
+            : bytes.length - 1;
+        if (
+          !match ||
+          (!match[1] && !match[2]) ||
+          !Number.isSafeInteger(start) ||
+          !Number.isSafeInteger(end) ||
+          start > end ||
+          start >= bytes.length
+        ) {
+          response.set('Content-Range', `bytes */${bytes.length}`).status(416).end();
+          return;
+        }
+        response
+          .set('Content-Range', `bytes ${start}-${end}/${bytes.length}`)
+          .status(206)
+          .send(bytes.subarray(start, end + 1));
+      } else response.send(bytes);
+    } finally {
+      session.abort.signal.removeEventListener('abort', stop);
+      response.off('close', stop);
+      release?.();
+    }
+  });
+
   app.get('/api/events', async (request, response) => {
     const session = requireSession(request);
     const raw = request.query.cursor ?? '0';
@@ -742,6 +1030,18 @@ export function createApp(options: ServerOptions = {}) {
           message: error.message,
           ...(flags.ambiguous === undefined ? {} : { ambiguous: flags.ambiguous }),
           ...(flags.retryable === undefined ? {} : { retryable: flags.retryable }),
+        },
+      });
+      return;
+    }
+    if (error instanceof multer.MulterError) {
+      response.status(error.code === 'LIMIT_FILE_SIZE' ? 413 : 400).json({
+        error: {
+          code: error.code === 'LIMIT_FILE_SIZE' ? 'MEDIA_TOO_LARGE' : 'INVALID_UPLOAD',
+          message:
+            error.code === 'LIMIT_FILE_SIZE'
+              ? 'Файл не должен превышать 16 МиБ.'
+              : 'Выберите один файл и проверьте параметры загрузки.',
         },
       });
       return;

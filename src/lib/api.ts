@@ -1,4 +1,4 @@
-import type { Credentials, EventBatch, Session } from './types';
+import type { AttachmentOptions, Credentials, EventBatch, MediaAttachment, Session } from './types';
 
 export class ApiError extends Error {
   readonly status: number;
@@ -41,7 +41,9 @@ export async function request<T>(
       credentials: 'same-origin',
       headers: {
         Accept: 'application/json',
-        ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+        ...(options.body && !(options.body instanceof FormData)
+          ? { 'Content-Type': 'application/json' }
+          : {}),
         ...options.headers,
       },
     });
@@ -104,6 +106,25 @@ export const api = {
       { method: 'POST', body: JSON.stringify({ chatId, message, clientId }), signal },
       true,
     ),
+  sendMedia: (
+    chatId: string,
+    file: File,
+    clientId: string,
+    options: AttachmentOptions = {},
+    signal?: AbortSignal,
+  ) => {
+    const body = new FormData();
+    body.append('file', file, file.name);
+    body.append('chatId', chatId);
+    body.append('clientId', clientId);
+    body.append('caption', options.caption ?? '');
+    body.append('kind', 'file');
+    return request<{ idMessage: string; media: MediaAttachment }>(
+      '/api/messages/media',
+      { method: 'POST', body, signal },
+      true,
+    );
+  },
   events: (cursor: number, signal?: AbortSignal) =>
     request<EventBatch>(`/api/events?cursor=${encodeURIComponent(cursor)}`, { signal }),
 };

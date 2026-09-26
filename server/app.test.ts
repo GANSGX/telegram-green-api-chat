@@ -3,6 +3,7 @@ import { request as httpRequest, type Server } from 'node:http';
 import { type AddressInfo } from 'node:net';
 import { createApp, type ServerOptions } from './app.js';
 import { type Fetch } from './green-api.js';
+import { MAX_MEDIA_BYTES } from './media.js';
 
 const credentials = {
   apiUrl: 'https://4100.api.green-api.com',
@@ -493,5 +494,387 @@ describe('single background queue consumer', () => {
     expect(a).toEqual(b);
     expect(a.events).toHaveLength(1);
     expect(a.events[0].kind).toBe('message');
+  });
+});
+
+const png = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 0]);
+function attachment(
+  options: {
+    bytes?: Uint8Array;
+    name?: string;
+    mime?: string;
+    clientId?: string;
+    caption?: string;
+    kind?: string;
+  } = {},
+) {
+  const form = new FormData();
+  form.append('chatId', '777');
+  form.append('clientId', options.clientId ?? 'media-intent-1');
+  form.append('caption', options.caption ?? 'Фото');
+  form.append('kind', options.kind ?? 'file');
+  form.append(
+    'file',
+    new Blob([new Uint8Array(options.bytes ?? png)], { type: options.mime ?? 'image/png' }),
+    options.name ?? 'photo.png',
+  );
+  return form;
+}
+const mediaResult = {
+  idMessage: 'media-provider-id',
+  urlFile: 'https://mediaout-4100.storage.yandexcloud.net/4100000000/photo.png',
+};
+function fileNotification(
+  url = 'https://4100.api.green-api.com/download/4100/photo.png',
+  id = 'media-event-id',
+) {
+  return {
+    receiptId: 1,
+    body: {
+      ...incoming(1, id).body,
+      messageData: {
+        typeMessage: 'imageMessage',
+        fileMessageData: {
+          downloadUrl: url,
+          fileName: 'photo.png',
+          mimeType: 'image/png',
+          caption: 'Фото',
+        },
+      },
+    },
+  };
+}
+
+describe('real attachment uploads and private downloads', () => {
+  it('preserves Cyrillic and emoji filenames from browser multipart encoding', async () => {
+    const { base, login, calls } = await setup({
+      sendFileByUpload: () => Response.json(mediaResult),
+    });
+    const cookie = await login();
+    const name = 'Привет 📎.png';
+    const response = await fetch(`${base}/api/messages/media`, {
+      method: 'POST',
+      body: attachment({ name }),
+      headers: { Cookie: cookie },
+    });
+    expect(response.status).toBe(200);
+    expect((await response.json()).media.fileName).toBe(name);
+    expect((calls('sendFileByUpload')[0][1]?.body as FormData).get('fileName')).toBe(name);
+  });
+
+  it('requires a session and same-origin request before reading a multipart upload', async () => {
+    const { base, calls, login } = await setup({
+      sendFileByUpload: () => Response.json(mediaResult),
+    });
+    expect(
+      (await fetch(`${base}/api/messages/media`, { method: 'POST', body: attachment() })).status,
+    ).toBe(401);
+    const cookie = await login();
+    expect(
+      (
+        await fetch(`${base}/api/messages/media`, {
+          method: 'POST',
+          body: attachment(),
+          headers: { Cookie: cookie, Origin: 'https://evil.test' },
+        })
+      ).status,
+    ).toBe(403);
+    expect(
+      (await fetch(`${base}/api/session`, { method: 'POST', body: attachment() })).status,
+    ).toBe(415);
+    expect(calls('sendFileByUpload')).toHaveLength(0);
+  });
+
+  it('sends real multipart bytes once, coalesces duplicates and isolates text/media intent IDs', async () => {
+    let complete!: (response: Response) => void;
+    const { base, login, calls, request } = await setup({
+      sendFileByUpload: (init) => {
+        expect(init?.headers).toEqual({ Accept: 'application/json' });
+        const form = init?.body as FormData;
+        expect(form.get('chatId')).toBe('777');
+        expect(form.get('caption')).toBe('Фото');
+        expect(form.get('fileName')).toBe('photo.png');
+        expect(form.get('file')).toBeInstanceOf(Blob);
+        return new Promise((resolve) => {
+          complete = resolve;
+        });
+      },
+    });
+    const cookie = await login();
+    const send = () =>
+      fetch(`${base}/api/messages/media`, {
+        method: 'POST',
+        body: attachment(),
+        headers: { Cookie: cookie },
+      });
+    const first = send();
+    const second = send();
+    await vi.waitFor(() => expect(calls('sendFileByUpload')).toHaveLength(1));
+    expect(
+      new Uint8Array(
+        await (
+          (calls('sendFileByUpload')[0][1]?.body as FormData).get('file') as Blob
+        ).arrayBuffer(),
+      ),
+    ).toEqual(png);
+    complete(Response.json(mediaResult));
+    const result = await (await first).json();
+    expect(await (await second).json()).toEqual(result);
+    expect(result).toMatchObject({
+      idMessage: mediaResult.idMessage,
+      media: { kind: 'image', mimeType: 'image/png', size: png.length },
+    });
+    expect(JSON.stringify(result)).not.toContain('yandexcloud');
+    expect(JSON.stringify(result)).not.toContain(credentials.apiTokenInstance);
+    expect(
+      (
+        await request('/messages', {
+          body: { chatId: '777', message: 'text', clientId: 'media-intent-1' },
+          cookie,
+        })
+      ).status,
+    ).toBe(409);
+    expect(
+      (
+        await fetch(`${base}/api/messages/media`, {
+          method: 'POST',
+          body: attachment({ bytes: new Uint8Array([...png, 1]) }),
+          headers: { Cookie: cookie },
+        })
+      ).status,
+    ).toBe(409);
+    expect(calls('sendFileByUpload')).toHaveLength(1);
+  });
+
+  it('rejects empty, oversized, duplicate-file, oversized-caption and cancelled voice requests before upstream', async () => {
+    const { base, login, calls } = await setup();
+    const cookie = await login();
+    for (const form of [
+      attachment({ bytes: new Uint8Array() }),
+      attachment({ caption: 'a'.repeat(1025) }),
+      attachment({ kind: 'voice' }),
+    ]) {
+      expect(
+        (
+          await fetch(`${base}/api/messages/media`, {
+            method: 'POST',
+            body: form,
+            headers: { Cookie: cookie },
+          })
+        ).status,
+      ).toBe(400);
+    }
+    const duplicate = attachment();
+    duplicate.append('file', new Blob([png]), 'second.png');
+    expect(
+      (
+        await fetch(`${base}/api/messages/media`, {
+          method: 'POST',
+          body: duplicate,
+          headers: { Cookie: cookie },
+        })
+      ).status,
+    ).toBe(400);
+    expect(
+      (
+        await fetch(`${base}/api/messages/media`, {
+          method: 'POST',
+          body: attachment({ bytes: new Uint8Array(MAX_MEDIA_BYTES + 1) }),
+          headers: { Cookie: cookie },
+        })
+      ).status,
+    ).toBe(413);
+    expect(calls('sendFileByUpload')).toHaveLength(0);
+  });
+
+  it('retains ambiguous upload failures without resending', async () => {
+    const { base, login, calls } = await setup({
+      sendFileByUpload: () => {
+        throw new Error('secret upload url');
+      },
+    });
+    const cookie = await login();
+    for (let i = 0; i < 2; i++) {
+      const response = await fetch(`${base}/api/messages/media`, {
+        method: 'POST',
+        body: attachment(),
+        headers: { Cookie: cookie },
+      });
+      expect(response.status).toBe(502);
+      expect(await response.json()).toMatchObject({
+        error: { code: 'SEND_UNCERTAIN', ambiguous: true, retryable: false },
+      });
+    }
+    expect(calls('sendFileByUpload')).toHaveLength(1);
+  });
+
+  it('bounds simultaneous uploads before allocating a fifth file and aborts the upstream on logout', async () => {
+    const signals: AbortSignal[] = [];
+    const { base, login, calls, request } = await setup({
+      sendFileByUpload: (init) =>
+        new Promise((_resolve, reject) => {
+          signals.push(init!.signal!);
+          init!.signal!.addEventListener('abort', () => reject(new Error('aborted')), {
+            once: true,
+          });
+        }),
+    });
+    const cookie = await login();
+    const uploads = Array.from({ length: 4 }, (_, i) =>
+      fetch(`${base}/api/messages/media`, {
+        method: 'POST',
+        body: attachment({ clientId: `parallel-upload-${i}` }),
+        headers: { Cookie: cookie },
+      }),
+    );
+    await vi.waitFor(() => expect(calls('sendFileByUpload')).toHaveLength(4));
+    expect(
+      (
+        await fetch(`${base}/api/messages/media`, {
+          method: 'POST',
+          body: attachment(),
+          headers: { Cookie: cookie },
+        })
+      ).status,
+    ).toBe(429);
+    await request('/session', { method: 'DELETE', cookie });
+    expect(signals.every((signal) => signal.aborted)).toBe(true);
+    for (const response of await Promise.all(uploads)) expect(response.status).toBe(502);
+  });
+
+  it('normalizes media before ACK, hides provider URLs, streams bytes with range support and isolates sessions', async () => {
+    const queue = [fileNotification()];
+    const { base, login, request, calls } = await setup(
+      {
+        receiveNotification: () => Response.json(queue.shift() ?? null),
+        '4100': (_init, url) => {
+          expect(url).toBe('https://4100.api.green-api.com/download/4100/photo.png');
+          return new Response(png, {
+            headers: { 'content-type': 'text/html', 'set-cookie': 'provider-secret' },
+          });
+        },
+      },
+      { polling: true },
+    );
+    const cookie = await login();
+    await vi.waitFor(() => expect(calls('deleteNotification')).toHaveLength(1));
+    const events = await (await request('/events?cursor=0', { cookie })).json();
+    const event = events.events.find((item: { kind: string }) => item.kind === 'message');
+    expect(event).toMatchObject({ text: 'Фото', media: { kind: 'image', mimeType: 'image/png' } });
+    expect(JSON.stringify(events)).not.toContain('green-api.com');
+    expect((await fetch(`${base}${event.media.url}`)).status).toBe(401);
+    const other = await login({ ...credentials, idInstance: '4100000001' });
+    expect((await fetch(`${base}${event.media.url}`, { headers: { Cookie: other } })).status).toBe(
+      404,
+    );
+    const media = await fetch(`${base}${event.media.url}`, {
+      headers: { Cookie: cookie, Range: 'bytes=0-3' },
+    });
+    expect(media.status).toBe(206);
+    expect(media.headers.get('content-range')).toBe(`bytes 0-3/${png.length}`);
+    expect(media.headers.get('content-type')).toBe('image/png');
+    expect(media.headers.get('cache-control')).toBe('no-store');
+    expect(media.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(media.headers.get('set-cookie')).toBeNull();
+    expect(new Uint8Array(await media.arrayBuffer())).toEqual(png.slice(0, 4));
+    expect(
+      (
+        await fetch(`${base}${event.media.url}`, {
+          headers: { Cookie: cookie, Range: 'bytes=999-' },
+        })
+      ).status,
+    ).toBe(416);
+  });
+
+  it('ACKs an unsupported media URL and returns unavailable media without making SSRF requests', async () => {
+    const queue = [fileNotification('https://127.0.0.1/internal')];
+    const { base, login, request, calls, provider } = await setup(
+      { receiveNotification: () => Response.json(queue.shift() ?? null) },
+      { polling: true },
+    );
+    const cookie = await login();
+    await vi.waitFor(() => expect(calls('deleteNotification')).toHaveLength(1));
+    const events = await (await request('/events?cursor=0', { cookie })).json();
+    const event = events.events.find((item: { kind: string }) => item.kind === 'message');
+    expect(event.media.unavailable).toBe(true);
+    expect((await fetch(`${base}${event.media.url}`, { headers: { Cookie: cookie } })).status).toBe(
+      410,
+    );
+    expect(provider.mock.calls.every(([url]) => String(url).startsWith(credentials.apiUrl))).toBe(
+      true,
+    );
+  });
+
+  it('queues the fifth visible attachment and aborts waiting downloads on logout', async () => {
+    const queue = [fileNotification()];
+    const downloads: ((response: Response) => void)[] = [];
+    const { base, login, request, calls } = await setup(
+      {
+        receiveNotification: () => Response.json(queue.shift() ?? null),
+        '4100': (init) =>
+          new Promise((resolve, reject) => {
+            downloads.push(resolve);
+            init!.signal!.addEventListener('abort', () => reject(new Error('aborted')), {
+              once: true,
+            });
+          }),
+      },
+      { polling: true },
+    );
+    const cookie = await login();
+    await vi.waitFor(() => expect(calls('deleteNotification')).toHaveLength(1));
+    const events = await (await request('/events?cursor=0', { cookie })).json();
+    const url = events.events.find((item: { kind: string }) => item.kind === 'message').media.url;
+    const requests = Array.from({ length: 6 }, () =>
+      fetch(`${base}${url}`, { headers: { Cookie: cookie } }),
+    );
+    await vi.waitFor(() => expect(downloads).toHaveLength(4));
+    downloads[0](new Response(png));
+    await vi.waitFor(() => expect(downloads).toHaveLength(5));
+    await request('/session', { method: 'DELETE', cookie });
+    const responses = await Promise.all(requests);
+    expect(responses.map((value) => value.status).filter((value) => value === 200)).toHaveLength(1);
+    expect(responses.every((value) => value.status !== 429)).toBe(true);
+    expect(downloads).toHaveLength(5);
+  });
+
+  it('correlates an attachment echo arriving before the upload response and preserves uploaded metadata', async () => {
+    let deliver!: (response: Response) => void;
+    let complete!: (response: Response) => void;
+    let first = true;
+    const { base, request, login, calls } = await setup(
+      {
+        receiveNotification: () => {
+          if (!first) return Response.json(null);
+          first = false;
+          return new Promise((resolve) => {
+            deliver = resolve;
+          });
+        },
+        sendFileByUpload: () =>
+          new Promise((resolve) => {
+            complete = resolve;
+          }),
+      },
+      { polling: true },
+    );
+    const cookie = await login();
+    const send = fetch(`${base}/api/messages/media`, {
+      method: 'POST',
+      body: attachment(),
+      headers: { Cookie: cookie },
+    });
+    await vi.waitFor(() => expect(calls('sendFileByUpload')).toHaveLength(1));
+    const echo = fileNotification(undefined, mediaResult.idMessage);
+    echo.body.typeWebhook = 'outgoingAPIMessageReceived';
+    deliver(Response.json(echo));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(calls('deleteNotification')).toHaveLength(0);
+    complete(Response.json(mediaResult));
+    const sent = await (await send).json();
+    await vi.waitFor(() => expect(calls('deleteNotification')).toHaveLength(1));
+    const events = await (await request('/events?cursor=0', { cookie })).json();
+    const event = events.events.find((item: { kind: string }) => item.kind === 'message');
+    expect(event).toMatchObject({ clientId: 'media-intent-1', media: sent.media });
   });
 });

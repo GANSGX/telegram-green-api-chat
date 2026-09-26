@@ -1,4 +1,5 @@
 import { emptyHistory } from './domain';
+import { persistentMedia } from './media';
 import {
   MAX_HISTORY_CHATS,
   MAX_HISTORY_MESSAGES,
@@ -69,6 +70,7 @@ export function parseHistory(raw: string | null): HistoryState {
         text: message.text,
         timestamp: message.timestamp,
         outgoing: message.outgoing,
+        media: persistentMedia(message.media),
         status: message.status === 'sending' ? ('unknown' as const) : message.status,
         error:
           message.status === 'sending'
@@ -109,7 +111,17 @@ export function saveHistory(instanceId: string, history: HistoryState): boolean 
       prefix + instanceId,
       JSON.stringify({
         chats: history.chats.slice(0, MAX_HISTORY_CHATS),
-        messages: history.messages.slice(-MAX_HISTORY_MESSAGES),
+        messages: history.messages.slice(-MAX_HISTORY_MESSAGES).map((message) => ({
+          id: message.id,
+          clientId: message.clientId,
+          chatId: message.chatId,
+          text: message.text,
+          timestamp: message.timestamp,
+          outgoing: message.outgoing,
+          status: message.status,
+          error: message.error,
+          media: persistentMedia(message.media),
+        })),
         activeChatId: history.activeChatId,
         drafts: history.drafts,
       }),
